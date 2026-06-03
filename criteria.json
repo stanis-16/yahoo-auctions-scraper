@@ -1,1 +1,16 @@
-[]
+[
+  {
+    "label": " (EK2 EK3 EK4 EK5 EK8 EK9 EG2 EG6 EG9 DC2 DC1 B16A",
+    "url": "https://auctions.yahoo.co.jp/search/search?p=+%28EK2+EK3+EK4+EK5+EK8+EK9+EG2+EG6+EG9+DC2+DC1+B16A+EL1+EL2+EL3+DB6+DB8+MA4+MA6+MA7+MA5+%E3%82%AA%E3%83%AB%E3%83%86%E3%82%A3%E3%82%A2+%E3%83%89%E3%83%9E%E3%83%BC%E3%83%8B+%29&auccat=2084064595&vo=EK2+EK3+EK4+EK5+EK8+EK9+EG2+EG6+EG9+DC2+DC1+B16A+EL1+EL2+EL3+DB6+DB8+MA4+MA6+MA7+MA5+%E3%82%AA%E3%83%AB%E3%83%86%E3%82%A3%E3%82%A2+%E3%83%89%E3%83%9E%E3%83%BC%E3%83%8B&istatus=2&new=1&is_postage_mode=1&dest_pref_code=13&b=1&n=50",
+    "channel_id": 1511250012464480256,
+    "min_price": null,
+    "max_price": null,
+    "exclude": [
+      "ジャンク",
+      "破損",
+      "現状渡し"
+    ],
+    "include_any": [],
+    "include_all": []
+  }
+]
