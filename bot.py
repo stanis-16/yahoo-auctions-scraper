@@ -21,6 +21,7 @@ import base64
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -691,6 +692,11 @@ async def do_poll():
         if i < len(searches) - 1:
             await asyncio.sleep(3)
 
+    # Keep the in-memory cache bounded so it can't grow without limit over a long run
+    if len(listing_cache) > 4000:
+        for k in list(listing_cache.keys())[:len(listing_cache) - 3000]:
+            del listing_cache[k]
+
     first_run = False
     print("Poll complete.")
 
@@ -850,5 +856,18 @@ async def on_ready():
     print(f"Running — poll every {POLL_MINUTES} min, watchlist every {UPDATE_MINUTES} min")
 
 
+def main():
+    try:
+        client.run(BOT_TOKEN)
+    except discord.errors.HTTPException as e:
+        if getattr(e, "status", None) == 429:
+            # A rate-limited login means recent restarts were too frequent. Wait a long
+            # time before exiting so Railway's restart doesn't keep hammering the endpoint.
+            print("[startup] Discord login rate-limited (429). Sleeping 10 minutes before "
+                  "exit so restarts don't sustain the block.", flush=True)
+            time.sleep(600)
+        raise
+
+
 if __name__ == "__main__":
-    client.run(BOT_TOKEN)
+    main()
