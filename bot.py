@@ -48,8 +48,9 @@ OWNER_IDS: set[int] = {
 
 CRITERIA_FILE  = "criteria.json"
 WATCHLIST_FILE = "watchlist.json"
-POLL_MINUTES   = 20
-UPDATE_MINUTES = 15
+STANDARD_MINUTES = 30
+BIN_MINUTES      = 10
+UPDATE_MINUTES   = 15
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -57,12 +58,14 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 
 
 # ── In-memory state ────────────────────────────────────────────────────────────
-searches:      list = []
-seen_ids:      set  = set()
-watchlist:     list = []
-listing_cache: dict = {}
-first_run:     bool = True
-_posted_order: list = []   # ids in the order currently shown in the watchlist channel
+searches:       list = []
+seen_standard:  set  = set()
+seen_bin:       set  = set()
+watchlist:      list = []
+listing_cache:  dict = {}
+first_standard: bool = True
+first_bin:      bool = True
+_posted_order:  list = []
 
 
 # ── CSS selectors ──────────────────────────────────────────────────────────────
@@ -219,11 +222,26 @@ def sort_key(entry: dict):
 # Yahoo helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def normalize_url(url: str) -> str:
+JUNK_PARAMS = ("tab_ex", "ei", "aq", "oq", "sc_i", "fr", "x", "y")
+FORCED_PARAMS = {"s1": "new", "o1": "d", "n": "100", "b": "1"}
+DEFAULT_PARAMS = {"is_postage_mode": "1", "dest_pref_code": "16"}  # shipping est. to Toyama
+
+def normalize_url(url: str, extra: dict = None) -> str:
     p = urlparse(url)
     q = parse_qs(p.query)
-    q.update({"s1": ["new"], "o1": ["d"], "n": ["50"]})
+    for junk in JUNK_PARAMS:
+        q.pop(junk, None)
+    for k, v in DEFAULT_PARAMS.items():
+        q.setdefault(k, [v])
+    for k, v in FORCED_PARAMS.items():
+        q[k] = [v]
+    if extra:
+        for k, v in extra.items():
+            q[k] = [v]
     return urlunparse(p._replace(query=urlencode(q, doseq=True)))
+
+def bin_url(url: str, bin_max: int) -> str:
+    return normalize_url(url, extra={"price_type": "bidorbuyprice", "min": "", "max": str(bin_max)})
 
 def url_to_label(url: str) -> str:
     q = parse_qs(urlparse(url).query)
@@ -307,6 +325,19 @@ def passes_filters(listing: dict, search: dict) -> bool:
         return False
     if search.get("min_price") is not None and price is not None and price < search["min_price"]:
         return False
+    if any(w in title for w in search.get("exclude", [])):
+        return False
+    inc_any = search.get("include_any", [])
+    if inc_any and not any(w in title for w in inc_any):
+        return False
+    inc_all = search.get("include_all", [])
+    if inc_all and not all(w in title for w in inc_all):
+        return False
+    return True
+
+
+def passes_keyword_filters(listing: dict, search: dict) -> bool:
+    title = listing.get("title") or ""
     if any(w in title for w in search.get("exclude", [])):
         return False
     inc_any = search.get("include_any", [])
@@ -527,21 +558,29 @@ class CategoryModal(discord.ui.Modal, title="Name this search"):
         self.name_input = discord.ui.TextInput(
             label="Category name (shown at top of alerts)",
             default=default_name, max_length=80)
+        self.bin_input = discord.ui.TextInput(
+            label="Buy-It-Now max price in \u00a5 (optional)",
+            placeholder="Leave blank for no BIN alerts", required=False, max_length=12)
         self.add_item(self.name_input)
+        self.add_item(self.bin_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         name = self.name_input.value.strip() or url_to_label(self.url)
+        digits = re.sub(r"[^\d]", "", self.bin_input.value or "")
+        bin_max = int(digits) if digits else None
         entry = {
             "label": name, "url": self.url, "channel_id": self.channel_id,
             "enabled": True, "min_price": None, "max_price": None,
+            "bin_max_price": bin_max,
             "exclude": ["ジャンク", "破損", "現状渡し"], "include_any": [], "include_all": [],
         }
         searches.append(entry)
         await interaction.response.defer(ephemeral=True)
         if await save_criteria():
             await baseline_search(entry)
+            extra = f"  \u00b7  BIN alerts \u2264 \u00a5{bin_max:,}" if bin_max else ""
             await interaction.followup.send(
-                f"✅ Added **{name}** → <#{self.channel_id}>", ephemeral=True)
+                f"✅ Added **{name}** → <#{self.channel_id}>{extra}", ephemeral=True)
         else:
             searches.pop()
             await interaction.followup.send("❌ Failed to save to GitHub.", ephemeral=True)
@@ -615,8 +654,9 @@ class ManageView(discord.ui.View):
             return e
         for s in searches:
             on = s.get("enabled", True)
+            bin_txt = f" · 💰 BIN ≤ ¥{s['bin_max_price']:,}" if s.get("bin_max_price") else ""
             e.add_field(name=f"{'🟢' if on else '🔴'} {s['label']}",
-                        value=f"→ <#{s.get('channel_id')}>", inline=False)
+                        value=f"→ <#{s.get('channel_id')}>{bin_txt}", inline=False)
         return e
 
     async def _on_select(self, interaction: discord.Interaction):
@@ -648,112 +688,194 @@ class ManageView(discord.ui.View):
 # Core logic
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def fetch_pages(url: str, seen_set: set, extra: dict = None, max_pages: int = 5) -> list:
+    """Fetch newest-first pages, stopping once a page contains an already-seen listing
+    (everything after it is older), results run out, or max_pages is reached. Normally
+    returns just page 1; only goes deeper during a burst of new listings."""
+    collected = []
+    for page in range(max_pages):
+        ex = dict(extra or {})
+        ex["b"] = str(page * 100 + 1)
+        try:
+            listings = parse_listings(await fetch_html(normalize_url(url, extra=ex)))
+        except Exception as e:
+            print(f"[!] page {page + 1} fetch failed: {e}")
+            break
+        if not listings:
+            break
+        collected.extend(listings)
+        if any(l["id"] in seen_set for l in listings):
+            break                  # reached already-seen territory
+        if len(listings) < 100:
+            break                  # last page
+        await asyncio.sleep(2)     # politeness between pages
+    return collected
+
+
 async def baseline_search(search: dict):
-    url = normalize_url(search.get("url", ""))
-    if not url:
-        return
+    """Mark current listings as seen in both pools so a new criteria doesn't flood."""
+    label = search.get("label")
     try:
-        for listing in parse_listings(await fetch_html(url)):
-            seen_ids.add(listing["id"])
-        print(f"Baselined '{search.get('label')}'")
+        for listing in parse_listings(await fetch_html(normalize_url(search["url"]))):
+            seen_standard.add(listing["id"])
     except Exception as e:
-        print(f"[!] Baseline failed for '{search.get('label')}': {e}")
+        print(f"[!] Standard baseline failed for '{label}': {e}")
+    if search.get("bin_max_price"):
+        try:
+            for listing in parse_listings(await fetch_html(bin_url(search["url"], search["bin_max_price"]))):
+                seen_bin.add(listing["id"])
+        except Exception as e:
+            print(f"[!] BIN baseline failed for '{label}': {e}")
+    print(f"Baselined '{label}'")
 
-async def do_poll():
-    global first_run
+MAX_PAGES = 5  # safety cap for smart pagination (5 × 100 = up to 500 newest items)
+
+async def collect_new(base_url, seen_set, bin_max=None):
+    """Walk result pages newest-first, returning listings not yet in seen_set.
+    Stops at the first already-seen item (everything older is already seen too),
+    a short final page, or MAX_PAGES — so normally it only fetches page one and
+    only pages deeper during a genuine burst of new listings."""
+    new_items, b = [], 1
+    for _ in range(MAX_PAGES):
+        extra = {"b": str(b)}
+        if bin_max is not None:
+            extra.update({"price_type": "bidorbuyprice", "min": "", "max": str(bin_max)})
+        try:
+            listings = parse_listings(await fetch_html(normalize_url(base_url, extra=extra)))
+        except Exception as e:
+            print(f"[!] page fetch failed (b={b}): {e}")
+            break
+        if not listings:
+            break
+        hit_seen = False
+        for l in listings:
+            if l["id"] in seen_set:
+                hit_seen = True
+                break
+            new_items.append(l)
+        if hit_seen or len(listings) < 100:
+            break
+        b += 100
+        await asyncio.sleep(2)
+    return new_items
+
+
+async def do_standard_poll():
+    global first_standard
     if not searches:
-        print("No searches configured yet."); return
-    if first_run:
-        print("First run — building baseline...")
-
-    bin_channel = client.get_channel(BIN_CHANNEL_ID) if BIN_CHANNEL_ID else None
-
+        return
+    if first_standard:
+        print("Standard pool — first run, building baseline (no alerts).")
     for i, search in enumerate(searches):
         if not search.get("enabled", True):
             continue
-        url   = normalize_url(search.get("url", ""))
         label = search.get("label", "?")
-        if not url:
-            continue
-        try:
-            html = await fetch_html(url)
-        except Exception as e:
-            print(f"[!] Fetch failed for '{label}': {e}"); continue
 
-        listings = parse_listings(html)
-        print(f"[{label}] {len(listings)} listings parsed")
-
-        # Refresh any watched items that still appear in these results
-        if watchlist:
-            wl_by_id = {w["id"]: w for w in watchlist}
-            for listing in listings:
-                w = wl_by_id.get(listing["id"])
-                if w:
-                    if listing.get("price") is not None:
-                        w["price"] = listing["price"]
-                    if listing.get("time_secs") is not None:
-                        w["end_timestamp"] = end_ts_from_secs(listing["time_secs"])
-
-        if first_run:
-            for listing in listings:
-                seen_ids.add(listing["id"])
+        if first_standard:
+            # baseline: page one only, mark seen, no alerts, no pagination
+            try:
+                listings = parse_listings(await fetch_html(normalize_url(search["url"])))
+            except Exception as e:
+                print(f"[!] std baseline failed for '{label}': {e}"); continue
+            for l in listings:
+                seen_standard.add(l["id"])
+            print(f"[std/{label}] baseline {len(listings)}")
         else:
+            new_items = await collect_new(search["url"], seen_standard)
+            print(f"[std/{label}] {len(new_items)} new")
+            if watchlist:
+                wl = {w["id"]: w for w in watchlist}
+                for l in new_items:
+                    w = wl.get(l["id"])
+                    if w:
+                        if l.get("price") is not None:     w["price"] = l["price"]
+                        if l.get("time_secs") is not None: w["end_timestamp"] = end_ts_from_secs(l["time_secs"])
             channel = client.get_channel(int(search["channel_id"])) if search.get("channel_id") else None
-            for listing in listings:
-                if listing["id"] in seen_ids:
+            for l in new_items:
+                seen_standard.add(l["id"])
+                listing_cache[l["id"]] = l
+                if not passes_filters(l, search):
                     continue
-                seen_ids.add(listing["id"])
-                listing_cache[listing["id"]] = listing
-                if not passes_filters(listing, search):
-                    continue
-                embed = make_listing_embed(listing, label)
                 if channel:
                     try:
-                        await channel.send(embed=embed, view=WatchView())
+                        await channel.send(embed=make_listing_embed(l, label), view=WatchView())
                     except discord.HTTPException as e:
-                        print(f"[!] post error: {e}")
-                if bin_channel and listing.get("buynow_price"):
-                    try:
-                        await bin_channel.send(embed=make_listing_embed(listing, label), view=WatchView())
-                    except discord.HTTPException as e:
-                        print(f"[!] BIN post error: {e}")
-
+                        print(f"[!] std post error: {e}")
         if i < len(searches) - 1:
             await asyncio.sleep(3)
 
-    # Keep the in-memory cache bounded so it can't grow without limit over a long run
     if len(listing_cache) > 4000:
         for k in list(listing_cache.keys())[:len(listing_cache) - 3000]:
             del listing_cache[k]
+    first_standard = False
+    print("Standard poll complete.")
 
-    first_run = False
-    print("Poll complete.")
 
-async def do_watchlist_update():
-    if not watchlist:
+async def do_bin_poll():
+    global first_bin
+    if not BIN_CHANNEL_ID:
         return
-    # Time remaining is computed live from each item's end_timestamp, so no
-    # per-item re-fetch is needed. Prices refresh in do_poll() whenever a watched
-    # item still shows up in a search's results.
-    await check_ending_soon()
-    await rebuild_watchlist()
-    print("Watchlist refreshed.")
+    bin_channel = client.get_channel(BIN_CHANNEL_ID)
+    if not bin_channel:
+        return
+    active = [s for s in searches if s.get("enabled", True) and s.get("bin_max_price")]
+    if not active:
+        return
+    if first_bin:
+        print("BIN pool — first run, building baseline (no alerts).")
+    for i, search in enumerate(active):
+        label   = search.get("label", "?")
+        bin_max = search["bin_max_price"]
+        if first_bin:
+            try:
+                listings = parse_listings(await fetch_html(bin_url(search["url"], bin_max)))
+            except Exception as e:
+                print(f"[!] bin baseline failed for '{label}': {e}"); continue
+            for l in listings:
+                seen_bin.add(l["id"])
+            print(f"[bin/{label}] baseline {len(listings)}")
+        else:
+            new_items = await collect_new(search["url"], seen_bin, bin_max=bin_max)
+            print(f"[bin/{label}] {len(new_items)} new")
+            for l in new_items:
+                seen_bin.add(l["id"])
+                listing_cache[l["id"]] = l
+                if not passes_keyword_filters(l, search):
+                    continue
+                try:
+                    await bin_channel.send(
+                        embed=make_listing_embed(l, f"{label} · BIN ≤ ¥{bin_max:,}"),
+                        view=WatchView())
+                except discord.HTTPException as e:
+                    print(f"[!] bin post error: {e}")
+        if i < len(active) - 1:
+            await asyncio.sleep(3)
+    first_bin = False
+    print("BIN poll complete.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task loops
 # ══════════════════════════════════════════════════════════════════════════════
 
-@tasks.loop(minutes=POLL_MINUTES)
-async def poll_loop():
-    await do_poll()
+@tasks.loop(minutes=STANDARD_MINUTES)
+async def standard_loop():
+    await do_standard_poll()
+
+@tasks.loop(minutes=BIN_MINUTES)
+async def bin_loop():
+    await do_bin_poll()
 
 @tasks.loop(minutes=UPDATE_MINUTES)
 async def watchlist_loop():
     await do_watchlist_update()
 
-@poll_loop.before_loop
-async def before_poll():
+@standard_loop.before_loop
+async def before_standard():
+    await client.wait_until_ready()
+
+@bin_loop.before_loop
+async def before_bin():
     await client.wait_until_ready()
 
 @watchlist_loop.before_loop
@@ -770,43 +892,59 @@ async def manage(interaction: discord.Interaction):
     v = ManageView()
     await interaction.response.send_message(embed=v._embed(), view=v, ephemeral=True)
 
-@tree.command(name="debug-selectors", description="Test which selectors work on an auction page")
-@app_commands.describe(url="An individual Yahoo auction URL")
+@tree.command(name="debug-selectors", description="Inspect a search or auction page")
+@app_commands.describe(url="A search URL (dumps parsed listings) or an auction URL (dumps embedded data)")
 async def debug_selectors(interaction: discord.Interaction, url: str):
     await interaction.response.defer(ephemeral=True)
+
+    # --- Search URL: dump what the bot parses, to verify current vs BIN price ---
+    if "/search/search" in url:
+        try:
+            html = await fetch_html(normalize_url(url))
+        except Exception as e:
+            await interaction.followup.send(f"Fetch failed: {e}", ephemeral=True); return
+        listings = parse_listings(html)
+        lines = [f"parsed {len(listings)} listings (first 6):", ""]
+        for l in listings[:6]:
+            lines.append(f"current={l['price']}  BIN={l['buynow_price']}  time={l['time_left']}")
+            lines.append(f"  {(l['title'] or '')[:48]}")
+        out = "\n".join(lines)[:1900]
+        await interaction.followup.send(f"```\n{out}\n```", ephemeral=True); return
+
+    # --- Auction URL: inspect embedded JSON ---
     m = YAHOO_ITEM_RE.search(url)
     if not m:
-        await interaction.followup.send("That doesn't look like an auction URL.", ephemeral=True); return
+        await interaction.followup.send("That doesn't look like a Yahoo search or auction URL.", ephemeral=True); return
     aid = m.group(1)
     try:
         html = await fetch_html(f"https://page.auctions.yahoo.co.jp/jp/auction/{aid}")
     except Exception as e:
         await interaction.followup.send(f"Fetch failed: {e}", ephemeral=True); return
-    soup  = BeautifulSoup(html, "html.parser")
-    lines = []
-    for prop in ("og:title", "og:image"):
-        tag = soup.find("meta", attrs={"property": prop})
-        lines.append(f"{prop}: {(tag.get('content')[:40] + '...') if tag and tag.get('content') else 'MISSING'}")
-    lines.append(f"ITEM_PRICE_SEL ({ITEM_PRICE_SEL}) -> {_text(soup.select_one(ITEM_PRICE_SEL)) or 'NONE'}")
-    lines.append(f"ITEM_TIME_SEL  ({ITEM_TIME_SEL}) -> {_text(soup.select_one(ITEM_TIME_SEL)) or 'NONE'}")
-    lines.append("\n-- price-like classes --")
-    seen = set()
-    for el in soup.find_all(class_=re.compile("Price|price")):
-        cls = ".".join(el.get("class", []))
-        if cls in seen: continue
-        seen.add(cls)
-        txt = el.get_text(strip=True)[:25]
-        if txt: lines.append(f".{cls} = {txt}")
-        if len(seen) > 10: break
-    lines.append("\n-- time/count-like classes --")
-    seen = set()
-    for el in soup.find_all(class_=re.compile("Count|Time|count|time|End|end")):
-        cls = ".".join(el.get("class", []))
-        if cls in seen: continue
-        seen.add(cls)
-        txt = el.get_text(strip=True)[:25]
-        if txt: lines.append(f".{cls} = {txt}")
-        if len(seen) > 10: break
+
+    lines = [f"HTML length: {len(html):,}", f"'円' count: {html.count('円')}"]
+    for marker in ("__NEXT_DATA__", "__PRELOADED_STATE__", "__INITIAL_STATE__", "application/ld+json"):
+        lines.append(f"{marker}: {'YES' if marker in html else 'no'}")
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "{}")
+            blob = json.dumps(data, ensure_ascii=False).lower()
+            if "price" in blob or "offer" in blob:
+                keys = list(data.keys()) if isinstance(data, dict) else ["(list)"]
+                lines.append("ld+json keys: " + ", ".join(keys[:12]))
+                break
+        except Exception:
+            pass
+    lines.append("-- candidate JSON fields --")
+    patt = re.compile(r'"([A-Za-z_]*(?:price|Price|bid|Bid|[Ee]nd|[Tt]ime)[A-Za-z_]*)"\s*:\s*("?[^",}\]]{1,40})')
+    seen = []
+    for mm in patt.finditer(html):
+        pair = f"{mm.group(1)}: {mm.group(2)}"
+        if pair not in seen:
+            seen.append(pair)
+        if len(seen) >= 22:
+            break
+    lines.extend(seen or ["(none found)"])
     out = "\n".join(lines)[:1900]
     await interaction.followup.send(f"```\n{out}\n```", ephemeral=True)
 
@@ -815,7 +953,8 @@ async def debug_selectors(interaction: discord.Interaction, url: str):
 async def check_now(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"🔍 Checking {len(searches)} search(es) now...", ephemeral=True)
-    asyncio.create_task(do_poll())
+    asyncio.create_task(do_standard_poll())
+    asyncio.create_task(do_bin_poll())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -881,11 +1020,13 @@ async def on_ready():
     client.add_view(WatchlistItemView())
     await tree.sync()
     print("Slash commands synced")
-    if not poll_loop.is_running():
-        poll_loop.start()
+    if not standard_loop.is_running():
+        standard_loop.start()
+    if not bin_loop.is_running():
+        bin_loop.start()
     if not watchlist_loop.is_running():
         watchlist_loop.start()
-    print(f"Running — poll every {POLL_MINUTES} min, watchlist every {UPDATE_MINUTES} min")
+    print(f"Running — standard {STANDARD_MINUTES}m, BIN {BIN_MINUTES}m, watchlist {UPDATE_MINUTES}m")
 
 
 def main():
