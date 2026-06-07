@@ -62,6 +62,7 @@ seen_ids:      set  = set()
 watchlist:     list = []
 listing_cache: dict = {}
 first_run:     bool = True
+_posted_order: list = []   # ids in the order currently shown in the watchlist channel
 
 
 # ── CSS selectors ──────────────────────────────────────────────────────────────
@@ -376,10 +377,37 @@ async def add_watch_entry(data: dict, search_label: str = "") -> bool:
     return True
 
 async def rebuild_watchlist():
-    """Delete the bot's watchlist embed messages and repost all items sorted by time left."""
+    """Update the watchlist channel. Edits cards in place (silent) when the sort order
+    is unchanged; only deletes & reposts (which pings) when the order actually changes."""
+    global _posted_order
     channel = client.get_channel(WATCHLIST_CHANNEL_ID)
     if not channel:
         return
+
+    watchlist.sort(key=sort_key)
+    new_order = [w["id"] for w in watchlist]
+    have_all_ids = all(w.get("message_id") for w in watchlist)
+
+    if new_order == _posted_order and have_all_ids:
+        # Same order: edit each card in place — no new notifications
+        for entry in watchlist:
+            try:
+                msg = await channel.fetch_message(entry["message_id"])
+                await msg.edit(embed=make_watchlist_embed(entry), view=WatchlistItemView())
+            except discord.NotFound:
+                await _full_rebuild(channel)   # a card was deleted; rebuild
+                return
+            except discord.HTTPException:
+                pass
+            await asyncio.sleep(0.3)
+        await save_watchlist()
+    else:
+        await _full_rebuild(channel)
+
+
+async def _full_rebuild(channel):
+    """Delete the bot's watchlist cards and repost them sorted by time left."""
+    global _posted_order
     try:
         async for msg in channel.history(limit=200):
             if msg.author == client.user and msg.embeds:
@@ -396,6 +424,7 @@ async def rebuild_watchlist():
             await asyncio.sleep(0.4)
         except discord.HTTPException as e:
             print(f"[!] Error posting watchlist item: {e}")
+    _posted_order = [w["id"] for w in watchlist]
     await save_watchlist()
 
 async def check_ending_soon():
@@ -845,6 +874,9 @@ async def on_ready():
     print(f"Loaded {len(searches)} search(es)")
     await load_watchlist()
     print(f"Loaded {len(watchlist)} watchlist item(s)")
+    global _posted_order
+    watchlist.sort(key=sort_key)
+    _posted_order = [w["id"] for w in watchlist]
     client.add_view(WatchView())
     client.add_view(WatchlistItemView())
     await tree.sync()
