@@ -1,6 +1,6 @@
 # Yahoo Auctions Japan Monitor
 
-A private Discord bot that scrapes Yahoo Auctions for new listings and sends alerts to a Discord channel. I built this as copy pasting searches in Japanese was tedious.
+A rapid prototype of a private Discord bot that scrapes Yahoo Auctions for new listings and sends alerts to a Discord channel. I built this as copy pasting searches in Japanese was tedious.
 
 I reverse-engineered the yahoo auction URL's so search criteria could be easily manipulated. This also allowed the use of hidden search options not available on the UI.
 
