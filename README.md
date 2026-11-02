@@ -6,6 +6,7 @@ I reverse-engineered the yahoo auction URL's so search criteria could be easily 
 
 Stack: Python, discord.py, aiohttp, BeautifulSoup, GitHub REST API, Railway
 
+<img width="582" height="716" alt="Screenshot 2026-11-02 160910" src="https://github.com/user-attachments/assets/c7b9a7db-0726-4b62-b0a0-eb57e1a024b3" />
 
 
 ## What it does
